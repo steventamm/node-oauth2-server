@@ -115,6 +115,71 @@ declare namespace OAuth2Server {
     }
 
     /**
+     * Pre-decoded JWT header passed to getUserFromJwtBearer and
+     * shouldTrustIdentityProvider. The signature has NOT been verified.
+     */
+    interface JwtBearerHeader {
+        alg: string;
+        /** For ID-JAG assertions this must equal 'oauth-id-jag+jwt'. */
+        typ?: string;
+        /** Key ID for JWKS key selection. */
+        kid?: string;
+        [key: string]: unknown;
+    }
+
+    /**
+     * Pre-decoded JWT payload passed to getUserFromJwtBearer and
+     * shouldTrustIdentityProvider. The signature has NOT been verified.
+     */
+    interface JwtBearerPayload {
+        /** Issuer — identifies the IdP; use for JWKS / key lookup. */
+        iss?: string;
+        /** Subject — the user identity asserted by the IdP. */
+        sub?: string;
+        /** Audience — must match this AS's identifier. */
+        aud?: string | string[];
+        exp?: number;
+        iat?: number;
+        jti?: string;
+        /** For ID-JAG: must match the authenticated client's id. */
+        client_id?: string;
+        [key: string]: unknown;
+    }
+
+    /**
+     * Constructor options for JwtBearerGrantType.
+     */
+    interface JwtBearerGrantTypeOptions {
+        model: JwtBearerModel;
+        accessTokenLifetime: number;
+        refreshTokenLifetime?: number;
+        /**
+         * Optional runtime hook for multi-issuer support.
+         *
+         * Called with the pre-decoded (unverified) JWT header and payload before
+         * model.getUserFromJwtBearer(). Return truthy to allow this issuer,
+         * falsy to reject with invalid_grant.
+         *
+         * Intended for database-backed issuer trust lookups at request time so
+         * new customer IDPs can be added without a server restart.
+         *
+         * Because the claims are NOT yet verified, this hook must not be used
+         * as the sole security gate — cryptographic verification must still
+         * happen inside model.getUserFromJwtBearer().
+         *
+         * @example
+         *   shouldTrustIdentityProvider: async (header, payload) => {
+         *     const idp = await db.findTrustedIdP(payload.iss);
+         *     return idp != null;
+         *   }
+         */
+        shouldTrustIdentityProvider?: (
+            header: JwtBearerHeader,
+            payload: JwtBearerPayload
+        ) => Promise<boolean | null | undefined> | boolean | null | undefined;
+    }
+
+    /**
      * JWT Bearer grant type (RFC 7523 / ID-JAG Cross App Access).
      *
      * Accepts a JWT Bearer assertion — typically an ID-JAG issued by an upstream
@@ -128,6 +193,7 @@ declare namespace OAuth2Server {
      * Required model methods: getUserFromJwtBearer, saveToken
      */
     class JwtBearerGrantType extends AbstractGrantType {
+        constructor(options: JwtBearerGrantTypeOptions);
         handle(request: Request, client: Client): Promise<Token | Falsey>;
     }
 
@@ -413,17 +479,27 @@ declare namespace OAuth2Server {
         /**
          * Invoked to validate a JWT Bearer assertion and return the associated user.
          *
-         * The model is responsible for all cryptographic validation, including:
-         *   - For ID-JAG assertions (typ: "oauth-id-jag+jwt"):
-         *     - Verify `aud` claim matches this authorization server
-         *     - Verify `client_id` claim matches the authenticated `client.id`
-         *     - Verify IdP signature using the IdP's public keys
-         *     - Verify `exp`, `iat`, `jti` claims per RFC 7519
-         *   - For general RFC 7523 assertions: standard JWT validation
+         * The framework pre-decodes the JWT and provides the decoded (unverified)
+         * header and payload alongside the raw assertion string. Using header.kid
+         * and payload.iss the model can select the correct JWKS key without
+         * re-parsing the token.
+         *
+         * The model is responsible for all cryptographic validation:
+         *   - Verify the IdP signature (fetch JWKS by payload.iss, select key by
+         *     header.kid, or use a static key for the issuer)
+         *   - For ID-JAG: verify header.typ === 'oauth-id-jag+jwt'
+         *   - Verify payload.aud matches this AS's identifier
+         *   - Verify payload.client_id matches client.id
+         *   - Verify payload.exp and payload.iat per RFC 7519
          *
          * Return the user object on success, or a falsy value to reject the grant.
          */
-        getUserFromJwtBearer(assertion: string, client: Client): Promise<User | Falsey>;
+        getUserFromJwtBearer(
+            assertion: string,
+            decodedHeader: JwtBearerHeader,
+            decodedPayload: JwtBearerPayload,
+            client: Client
+        ): Promise<User | Falsey>;
 
         /**
          * Invoked to check if the requested scope is valid for the user/client pair.

@@ -12,6 +12,23 @@ const Request = require('../../../lib/request');
 const should = require('chai').should();
 
 /**
+ * A minimal syntactically-valid JWT used in tests.
+ * The header and payload are real base64url-encoded JSON; the signature is
+ * fake. The grant type pre-decodes but does NOT verify — that's the model's job.
+ */
+const encode = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+const TEST_JWT_HEADER = { alg: 'RS256', typ: 'oauth-id-jag+jwt', kid: 'key-1' };
+const TEST_JWT_PAYLOAD = {
+  iss: 'https://idp.example.com',
+  sub: 'user-123',
+  aud: 'https://as.example.com',
+  client_id: 'client-id',
+  exp: Math.floor(Date.now() / 1000) + 300,
+  iat: Math.floor(Date.now() / 1000),
+};
+const ASSERTION = `${encode(TEST_JWT_HEADER)}.${encode(TEST_JWT_PAYLOAD)}.fakesig`;
+
+/**
  * Test `JwtBearerGrantType` integration.
  */
 
@@ -54,6 +71,18 @@ describe('JwtBearerGrantType integration', function() {
       }
     });
 
+    it('should throw an error if `shouldTrustIdentityProvider` is not a function', function() {
+      try {
+        const model = { getUserFromJwtBearer: function() {}, saveToken: function() {} };
+        new JwtBearerGrantType({ accessTokenLifetime: 120, model: model, shouldTrustIdentityProvider: 'not-a-function' });
+
+        should.fail();
+      } catch (e) {
+        e.should.be.an.instanceOf(InvalidArgumentError);
+        e.message.should.equal('Invalid argument: `shouldTrustIdentityProvider` must be a function');
+      }
+    });
+
     it('should not throw an error when `model` implements required methods', function() {
       const model = {
         getUserFromJwtBearer: function() {},
@@ -61,6 +90,15 @@ describe('JwtBearerGrantType integration', function() {
       };
 
       new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
+    });
+
+    it('should not throw an error when `shouldTrustIdentityProvider` is a function', function() {
+      const model = { getUserFromJwtBearer: function() {}, saveToken: function() {} };
+      new JwtBearerGrantType({
+        accessTokenLifetime: 120,
+        model: model,
+        shouldTrustIdentityProvider: async () => true
+      });
     });
   });
 
@@ -88,7 +126,7 @@ describe('JwtBearerGrantType integration', function() {
         saveToken: function() {}
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
-      const request = new Request({ body: { assertion: 'header.payload.sig' }, headers: {}, method: {}, query: {} });
+      const request = new Request({ body: { assertion: ASSERTION }, headers: {}, method: {}, query: {} });
 
       try {
         await grantType.handle(request);
@@ -125,7 +163,7 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -145,12 +183,13 @@ describe('JwtBearerGrantType integration', function() {
       const token = {};
       const client = { id: 'client-id' };
       const user = { id: 'user-id' };
-      const assertion = 'header.payload.sig';
       const scope = ['read'];
 
       const model = {
-        getUserFromJwtBearer: async function(_assertion, _client) {
-          _assertion.should.equal(assertion);
+        getUserFromJwtBearer: async function(_assertion, _header, _payload, _client) {
+          _assertion.should.equal(ASSERTION);
+          _header.should.deep.equal(TEST_JWT_HEADER);
+          _payload.should.deep.equal(TEST_JWT_PAYLOAD);
           _client.should.deep.equal(client);
           return { ...user };
         },
@@ -179,7 +218,7 @@ describe('JwtBearerGrantType integration', function() {
 
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: assertion, scope: scope.join(' ') },
+        body: { assertion: ASSERTION, scope: scope.join(' ') },
         headers: {},
         method: {},
         query: {}
@@ -204,7 +243,7 @@ describe('JwtBearerGrantType integration', function() {
 
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -221,7 +260,7 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -238,7 +277,7 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -267,6 +306,29 @@ describe('JwtBearerGrantType integration', function() {
       }
     });
 
+    it('should throw an error if the assertion cannot be decoded', async function() {
+      const model = {
+        getUserFromJwtBearer: () => should.fail('model should not be called for malformed assertions'),
+        saveToken: () => should.fail()
+      };
+      const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
+      const request = new Request({
+        body: { assertion: 'not.a.jwt' },
+        headers: {},
+        method: {},
+        query: {}
+      });
+
+      try {
+        await grantType.getUserFromJwtBearer(request, {});
+
+        should.fail();
+      } catch (e) {
+        e.should.be.an.instanceOf(InvalidGrantError);
+        e.message.should.equal('Invalid grant: assertion cannot be decoded');
+      }
+    });
+
     it('should throw an error if the model returns a falsy user', function() {
       const model = {
         getUserFromJwtBearer: function() { return null; },
@@ -274,7 +336,7 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -296,7 +358,7 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -309,30 +371,30 @@ describe('JwtBearerGrantType integration', function() {
         .catch(should.fail);
     });
 
-    it('should pass assertion and client to model', async function() {
-      const assertion = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.sig';
+    it('should pass assertion, decoded header, decoded payload, and client to model', async function() {
       const client = { id: 'my-client' };
-      let capturedAssertion, capturedClient;
+      let capturedArgs;
 
       const model = {
-        getUserFromJwtBearer: function(a, c) {
-          capturedAssertion = a;
-          capturedClient = c;
+        getUserFromJwtBearer: function(assertion, header, payload, c) {
+          capturedArgs = { assertion, header, payload, client: c };
           return { id: 'user' };
         },
         saveToken: () => should.fail()
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: assertion },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
       });
 
       await grantType.getUserFromJwtBearer(request, client);
-      capturedAssertion.should.equal(assertion);
-      capturedClient.should.equal(client);
+      capturedArgs.assertion.should.equal(ASSERTION);
+      capturedArgs.header.should.deep.equal(TEST_JWT_HEADER);
+      capturedArgs.payload.should.deep.equal(TEST_JWT_PAYLOAD);
+      capturedArgs.client.should.equal(client);
     });
 
     it('should support promises', function() {
@@ -343,7 +405,7 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
@@ -360,13 +422,135 @@ describe('JwtBearerGrantType integration', function() {
       };
       const grantType = new JwtBearerGrantType({ accessTokenLifetime: 120, model: model });
       const request = new Request({
-        body: { assertion: 'header.payload.sig' },
+        body: { assertion: ASSERTION },
         headers: {},
         method: {},
         query: {}
       });
 
       grantType.getUserFromJwtBearer(request, {}).should.be.an.instanceOf(Promise);
+    });
+  });
+
+  describe('shouldTrustIdentityProvider', function() {
+    it('should be called with decoded header and payload before the model', async function() {
+      const client = {};
+      const user = { id: 'user-id' };
+      let capturedHeader, capturedPayload;
+
+      const model = {
+        getUserFromJwtBearer: async function() { return user; },
+        saveToken: async function(_token) { return _token; }
+      };
+      const grantType = new JwtBearerGrantType({
+        accessTokenLifetime: 120,
+        model: model,
+        shouldTrustIdentityProvider: function(header, payload) {
+          capturedHeader = header;
+          capturedPayload = payload;
+          return true;
+        }
+      });
+      const request = new Request({ body: { assertion: ASSERTION }, headers: {}, method: {}, query: {} });
+
+      await grantType.getUserFromJwtBearer(request, client);
+      capturedHeader.should.deep.equal(TEST_JWT_HEADER);
+      capturedPayload.should.deep.equal(TEST_JWT_PAYLOAD);
+    });
+
+    it('should reject with invalid_grant when it returns false', async function() {
+      const model = {
+        getUserFromJwtBearer: () => should.fail('model should not be called when issuer is untrusted'),
+        saveToken: function() {}
+      };
+      const grantType = new JwtBearerGrantType({
+        accessTokenLifetime: 120,
+        model: model,
+        shouldTrustIdentityProvider: async () => false
+      });
+      const request = new Request({ body: { assertion: ASSERTION }, headers: {}, method: {}, query: {} });
+
+      try {
+        await grantType.getUserFromJwtBearer(request, {});
+
+        should.fail();
+      } catch (e) {
+        e.should.be.an.instanceOf(InvalidGrantError);
+        e.message.should.equal('Invalid grant: identity provider is not trusted');
+      }
+    });
+
+    it('should reject with invalid_grant when it returns null', async function() {
+      const model = {
+        getUserFromJwtBearer: () => should.fail('model should not be called when issuer is untrusted'),
+        saveToken: function() {}
+      };
+      const grantType = new JwtBearerGrantType({
+        accessTokenLifetime: 120,
+        model: model,
+        shouldTrustIdentityProvider: async () => null
+      });
+      const request = new Request({ body: { assertion: ASSERTION }, headers: {}, method: {}, query: {} });
+
+      try {
+        await grantType.getUserFromJwtBearer(request, {});
+
+        should.fail();
+      } catch (e) {
+        e.should.be.an.instanceOf(InvalidGrantError);
+        e.message.should.equal('Invalid grant: identity provider is not trusted');
+      }
+    });
+
+    it('should proceed when it returns true', async function() {
+      const user = { id: 'user-id' };
+      const model = {
+        getUserFromJwtBearer: async function() { return user; },
+        saveToken: async function(_token) { return _token; }
+      };
+      const grantType = new JwtBearerGrantType({
+        accessTokenLifetime: 120,
+        model: model,
+        shouldTrustIdentityProvider: async () => true
+      });
+      const request = new Request({ body: { assertion: ASSERTION }, headers: {}, method: {}, query: {} });
+
+      const result = await grantType.getUserFromJwtBearer(request, {});
+      result.should.equal(user);
+    });
+
+    it('should support async database-style lookups', async function() {
+      const user = { id: 'user-id' };
+      // Simulates a DB that knows about one issuer.
+      const trustedIssuers = new Map([['https://idp.example.com', { jwksUri: 'https://idp.example.com/.well-known/jwks.json' }]]);
+
+      const model = {
+        getUserFromJwtBearer: async function() { return user; },
+        saveToken: async function(_token) { return _token; }
+      };
+      const grantType = new JwtBearerGrantType({
+        accessTokenLifetime: 120,
+        model: model,
+        shouldTrustIdentityProvider: async (_header, payload) => trustedIssuers.has(payload.iss)
+      });
+
+      // Known issuer — should succeed.
+      const request = new Request({ body: { assertion: ASSERTION }, headers: {}, method: {}, query: {} });
+      const result = await grantType.getUserFromJwtBearer(request, {});
+      result.should.equal(user);
+
+      // Unknown issuer — should reject.
+      const unknownPayload = { ...TEST_JWT_PAYLOAD, iss: 'https://untrusted.example.com' };
+      const unknownAssertion = `${encode(TEST_JWT_HEADER)}.${encode(unknownPayload)}.fakesig`;
+      const request2 = new Request({ body: { assertion: unknownAssertion }, headers: {}, method: {}, query: {} });
+
+      try {
+        await grantType.getUserFromJwtBearer(request2, {});
+        should.fail();
+      } catch (e) {
+        e.should.be.an.instanceOf(InvalidGrantError);
+        e.message.should.equal('Invalid grant: identity provider is not trusted');
+      }
     });
   });
 
